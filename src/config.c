@@ -381,7 +381,7 @@ void config_parse(int argc, char* argv[], PCONFIGURATION config) {
   config->codec = CODEC_UNSPECIFIED;
   config->hdr = false;
   config->pin = 0;
-  config->port = 47989;
+  config->port = 1984;
 
   config->inputsCount = 0;
   config->mapping = get_path("gamecontrollerdb.txt", getenv("XDG_DATA_DIRS"));

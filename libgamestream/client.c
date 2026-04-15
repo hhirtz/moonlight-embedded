@@ -203,9 +203,6 @@ static int load_serverinfo(PSERVER_DATA server, bool https) {
   if (xml_search(data->memory, data->size, "PairStatus", &pairedText) != GS_OK)
     goto cleanup;
 
-  if (xml_search(data->memory, data->size, "appversion", (char**) &server->serverInfo.serverInfoAppVersion) != GS_OK)
-    goto cleanup;
-
   if (xml_search(data->memory, data->size, "state", &stateText) != GS_OK)
     goto cleanup;
 
@@ -218,23 +215,14 @@ static int load_serverinfo(PSERVER_DATA server, bool https) {
   if (xml_search(data->memory, data->size, "GsVersion", &server->gsVersion) != GS_OK)
     goto cleanup;
 
-  if (xml_search(data->memory, data->size, "GfeVersion", (char**) &server->serverInfo.serverInfoGfeVersion) != GS_OK)
-    goto cleanup;
-
   if (xml_search(data->memory, data->size, "HttpsPort", &httpsPortText) != GS_OK)
     goto cleanup;
 
   if (xml_modelist(data->memory, data->size, &server->modes) != GS_OK)
     goto cleanup;
 
-  // These fields are present on all version of GFE that this client supports
-  if (!strlen(currentGameText) || !strlen(pairedText) || !strlen(server->serverInfo.serverInfoAppVersion) || !strlen(stateText))
-    goto cleanup;
-
   server->paired = pairedText != NULL && strcmp(pairedText, "1") == 0;
   server->currentGame = currentGameText == NULL ? 0 : atoi(currentGameText);
-  server->serverInfo.serverCodecModeSupport = serverCodecModeSupportText == NULL ? SCM_H264 : atoi(serverCodecModeSupportText);
-  server->serverMajorVersion = atoi(server->serverInfo.serverInfoAppVersion);
   server->isNvidiaSoftware = strstr(stateText, "MJOLNIR") != NULL;
 
   server->httpsPort = atoi(httpsPortText);
@@ -763,11 +751,6 @@ int gs_start_app(PSERVER_DATA server, STREAM_CONFIGURATION *config, int appId, b
 
   free(result);
   result = NULL;
-
-  if (xml_search(data->memory, data->size, "sessionUrl0", &result) == GS_OK) {
-    server->serverInfo.rtspSessionUrl = result;
-    result = NULL;
-  }
 
   cleanup:
   if (result != NULL)

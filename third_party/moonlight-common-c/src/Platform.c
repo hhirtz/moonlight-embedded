@@ -297,7 +297,7 @@ int PltCreateThread(const char* name, ThreadEntry entry, void* context, PLT_THRE
             free(ctx);
             return err;
         }
-        
+
     }
 #endif
 
@@ -612,11 +612,6 @@ int initializePlatform(void) {
         return err;
     }
 
-    err = enet_initialize();
-    if (err != 0) {
-        return err;
-    }
-
     enterLowLatencyMode();
 
     return 0;
@@ -626,8 +621,6 @@ void cleanupPlatform(void) {
     exitLowLatencyMode();
 
     cleanupPlatformSockets();
-
-    enet_deinitialize();
 
     LC_ASSERT(activeThreads == 0);
     LC_ASSERT(activeMutexes == 0);

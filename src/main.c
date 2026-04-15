@@ -30,6 +30,7 @@
 #include "input/mapping.h"
 #include "input/evdev.h"
 #include "input/udev.h"
+#include <assert.h>
 #ifdef HAVE_LIBCEC
 #include "input/cec.h"
 #endif
@@ -38,9 +39,6 @@
 #endif
 
 #include <Limelight.h>
-
-#include <client.h>
-#include <discover.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,65 +52,196 @@
 #include <arpa/inet.h>
 #include <openssl/rand.h>
 
-static void applist(PSERVER_DATA server) {
-  PAPP_LIST list = NULL;
-  if (gs_applist(server, &list) != GS_OK) {
-    fprintf(stderr, "Can't get app list\n");
+#define PTYPE_ERROR 0
+#define PTYPE_APP 1
+
+void ctrl_parse_header(const char *buf, uint16_t *ptype, uint16_t *plen,
+                       uint8_t *seq) {
+  uint16_t header = *(uint16_t *)buf; // TODO support big endian platforms...
+
+  *ptype = header & 0x3f;
+  *plen = header >> 6;
+  *seq = (uint8_t)buf[2];
+}
+
+bool ctrl_is_gamed(const char *buf, ssize_t n) {
+  while (n >= 3) {
+    uint16_t ptype;
+    uint16_t plen;
+    uint8_t seq;
+
+    ctrl_parse_header(buf, &ptype, &plen, &seq);
+    if (n < plen) {
+      return false;
+    }
+
+    n -= plen + 3;
+    buf += plen + 3;
+  }
+
+  return n == 0;
+}
+
+typedef struct {
+  int currentGame;
+  SERVER_INFORMATION serverInfo;
+  unsigned short control_port;
+} SERVER_DATA, *PSERVER_DATA;
+
+void server_data_init(PSERVER_DATA server, char *address, unsigned short control_port) {
+  LiInitializeServerInformation(&server->serverInfo);
+  server->serverInfo.address = address;
+  server->control_port = control_port;
+}
+
+struct app {
+  char *name;
+  struct app *next;
+};
+
+void free_app_list(struct app **apps_ptr) {
+  if (!*apps_ptr) {
     return;
   }
 
-  for (int i = 1;list != NULL;i++) {
-    printf("%d. %s\n", i, list->name);
-    list = list->next;
+  struct app *ptr = *apps_ptr;
+  while (ptr) {
+    struct app *next = ptr->next;
+
+    free(ptr->name);
+    free(ptr);
+
+    ptr = next;
   }
+
+  *apps_ptr = NULL;
 }
 
-static int get_app_id(PSERVER_DATA server, const char *name) {
-  PAPP_LIST list = NULL;
-  if (gs_applist(server, &list) != GS_OK) {
-    fprintf(stderr, "Can't get app list\n");
-    return -1;
+static struct app *get_app_list(PSERVER_DATA server) {
+  int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (sock < 0) {
+    perror("socket");
+    abort();
   }
 
-  while (list != NULL) {
-    if (strcmp(list->name, name) == 0)
-      return list->id;
+  struct sockaddr_in peer_address = {0};
+  peer_address.sin_family = AF_INET;
+  peer_address.sin_addr.s_addr = inet_addr(server->serverInfo.address);
+  peer_address.sin_port = htons(server->control_port);
 
-    list = list->next;
+  int err =
+      connect(sock, (struct sockaddr *)&peer_address, sizeof(peer_address));
+  if (err < 0) {
+    perror("connect");
+    close(sock);
+    abort();
   }
-  return -1;
+
+  const size_t buf_len = 1027;
+  char *buf = calloc(1, buf_len);
+  if (!buf) {
+    close(sock);
+    abort();
+  }
+
+  fprintf(stderr, "sending applist\n");
+  ssize_t n = send(sock, buf, 3, 0);
+  if (n < 0) {
+    perror("send");
+    free(buf);
+    close(sock);
+    abort();
+  }
+
+  struct app *apps = NULL;
+  bool hasEnd = false;
+
+  while (!hasEnd) {
+    struct sockaddr_in addr = {0};
+    int addr_len = sizeof(addr);
+
+    n = recvfrom(sock, buf, buf_len, 0, (struct sockaddr *)&addr,
+                 &addr_len);
+    if (n < 0) {
+      perror("recvfrom");
+      free(buf);
+      close(sock);
+      abort();
+    }
+    assert(addr_len == sizeof(addr));
+
+    fprintf(stderr, "incoming datagram of length %ld\n", n);
+
+    if (n == buf_len || !ctrl_is_gamed(buf, n)) {
+      fprintf(stderr, "invalid datagram\n");
+      continue;
+    }
+
+    const char *ptr = buf;
+    while (n > 0 && !hasEnd) {
+      uint16_t ptype;
+      uint16_t plen;
+      uint8_t seq;
+
+      ctrl_parse_header(ptr, &ptype, &plen, &seq);
+      fprintf(stderr, "incoming packet of type %d and length %d\n", ptype, plen);
+
+      ptr += 3;
+      n -= 3;
+
+      struct app *new;
+
+      switch (ptype) {
+      case PTYPE_APP:
+        if (plen == 0) {
+          hasEnd = true;
+          break;
+        }
+
+        new = malloc(sizeof(struct app));
+        assert(new);
+
+        new->name = malloc(plen + 1);
+        assert(new->name);
+
+        memcpy(new->name, ptr, plen);
+        new->name[plen] = 0;
+
+        new->next = apps;
+
+        apps = new;
+
+        break;
+      default:
+        // ignore
+        break;
+      }
+
+      n -= plen;
+      ptr += plen;
+    }
+  }
+
+  return apps;
 }
 
-static void stream(PSERVER_DATA server, PCONFIGURATION config, enum platform system) {
-  int appId = get_app_id(server, config->app);
-  if (appId<0) {
-    fprintf(stderr, "Can't find app %s\n", config->app);
-    exit(-1);
+static void applist(PSERVER_DATA server) {
+  struct app *apps = get_app_list(server);
+
+  for (struct app *ptr = apps; ptr; ptr = ptr->next) {
+    printf("- %s\n", ptr->name);
   }
 
+  free_app_list(&apps);
+}
+
+static void stream(PSERVER_DATA server, PCONFIGURATION config,
+                   enum platform system) {
   int gamepads = 0;
   gamepads += evdev_gamepads;
   #ifdef HAVE_SDL
   gamepads += sdl_gamepads;
   #endif
-  int gamepad_mask = 0;
-  for (int i = 0; i < gamepads; i++)
-    gamepad_mask = (gamepad_mask << 1) + 1;
-
-  int ret = gs_start_app(server, &config->stream, appId, config->sops, config->localaudio, gamepad_mask);
-  if (ret < 0) {
-    if (ret == GS_NOT_SUPPORTED_4K)
-      fprintf(stderr, "Server doesn't support 4K\n");
-    else if (ret == GS_NOT_SUPPORTED_MODE)
-      fprintf(stderr, "Server doesn't support %dx%d (%d fps) or remove --nounsupported option\n", config->stream.width, config->stream.height, config->stream.fps);
-    else if (ret == GS_NOT_SUPPORTED_SOPS_RESOLUTION)
-      fprintf(stderr, "Optimal Playable Settings isn't supported for the resolution %dx%d, use supported resolution or add --nosops option\n", config->stream.width, config->stream.height);
-    else if (ret == GS_ERROR)
-      fprintf(stderr, "Gamestream error: %s\n", gs_error);
-    else
-      fprintf(stderr, "Errorcode starting app: %d\n", ret);
-    exit(-1);
-  }
 
   int drFlags = 0;
   if (config->fullscreen)
@@ -162,7 +291,7 @@ static void stream(PSERVER_DATA server, PCONFIGURATION config, enum platform sys
   if (config->quitappafter) {
     if (config->debug_level > 0)
       printf("Sending app quit request ...\n");
-    gs_quit_app(server);
+    abort(); // TODO quit app
   }
 
   platform_stop(system);
@@ -177,8 +306,6 @@ static void help() {
   printf("Usage: moonlight [action] (options) [host] [-port <number>]\n");
   printf("       moonlight [configfile]\n");
   printf("\n Actions\n\n");
-  printf("\tpair\t\t\tPair device with computer\n");
-  printf("\tunpair\t\t\tUnpair device with computer\n");
   printf("\tstream\t\t\tStream computer to device\n");
   printf("\tlist\t\t\tList available games and applications\n");
   printf("\tquit\t\t\tQuit the application or game being streamed\n");
@@ -228,13 +355,6 @@ static void help() {
   exit(0);
 }
 
-static void pair_check(PSERVER_DATA server) {
-  if (!server->paired) {
-    fprintf(stderr, "You must pair with the PC first\n");
-    exit(-1);
-  }
-}
-
 int main(int argc, char* argv[]) {
   CONFIGURATION config;
   config_parse(argc, argv, &config);
@@ -257,18 +377,8 @@ int main(int argc, char* argv[]) {
   }
 
   if (config.address == NULL) {
-    config.address = malloc(MAX_ADDRESS_SIZE);
-    if (config.address == NULL) {
-      perror("Not enough memory");
-      exit(-1);
-    }
-    config.address[0] = 0;
-    printf("Searching for server...\n");
-    gs_discover_server(config.address, &config.port);
-    if (config.address[0] == 0) {
-      fprintf(stderr, "Autodiscovery failed. Specify an IP address next time.\n");
-      exit(-1);
-    }
+    fprintf(stderr, "missing address\n");
+    exit(-1);
   }
 
   char host_config_file[128];
@@ -279,34 +389,11 @@ int main(int argc, char* argv[]) {
   SERVER_DATA server;
   printf("Connecting to %s...\n", config.address);
 
-  int ret;
-  if ((ret = gs_init(&server, config.address, config.port, config.key_dir, config.debug_level, config.unsupported)) == GS_OUT_OF_MEMORY) {
-    fprintf(stderr, "Not enough memory\n");
-    exit(-1);
-  } else if (ret == GS_ERROR) {
-    fprintf(stderr, "Gamestream error: %s\n", gs_error);
-    exit(-1);
-  } else if (ret == GS_INVALID) {
-    fprintf(stderr, "Invalid data received from server: %s\n", gs_error);
-    exit(-1);
-  } else if (ret == GS_UNSUPPORTED_VERSION) {
-    fprintf(stderr, "Unsupported version: %s\n", gs_error);
-    exit(-1);
-  } else if (ret != GS_OK) {
-    fprintf(stderr, "Can't connect to server %s\n", config.address);
-    exit(-1);
-  }
-
-  if (config.debug_level > 0) {
-    printf("GPU: %s, GFE: %s (%s, %s)\n", server.gpuType, server.serverInfo.serverInfoGfeVersion, server.gsVersion, server.serverInfo.serverInfoAppVersion);
-    printf("Server codec flags: 0x%x\n", server.serverInfo.serverCodecModeSupport);
-  }
+  server_data_init(&server, config.address, config.port);
 
   if (strcmp("list", config.action) == 0) {
-    pair_check(&server);
     applist(&server);
   } else if (strcmp("stream", config.action) == 0) {
-    pair_check(&server);
     enum platform system = platform_check(config.platform);
     if (config.debug_level > 0)
       printf("Platform %s\n", platform_name(system));
@@ -393,29 +480,8 @@ int main(int argc, char* argv[]) {
     }
 
     stream(&server, &config, system);
-  } else if (strcmp("pair", config.action) == 0) {
-    char pin[5];
-    if (config.pin > 0 && config.pin <= 9999) {
-      sprintf(pin, "%04d", config.pin);
-    } else {
-      sprintf(pin, "%d%d%d%d", (unsigned)random() % 10, (unsigned)random() % 10, (unsigned)random() % 10, (unsigned)random() % 10);
-    }
-    printf("Please enter the following PIN on the target PC: %s\n", pin);
-    fflush(stdout);
-    if (gs_pair(&server, &pin[0]) != GS_OK) {
-      fprintf(stderr, "Failed to pair to server: %s\n", gs_error);
-    } else {
-      printf("Succesfully paired\n");
-    }
-  } else if (strcmp("unpair", config.action) == 0) {
-    if (gs_unpair(&server) != GS_OK) {
-      fprintf(stderr, "Failed to unpair to server: %s\n", gs_error);
-    } else {
-      printf("Succesfully unpaired\n");
-    }
   } else if (strcmp("quit", config.action) == 0) {
-    pair_check(&server);
-    gs_quit_app(&server);
+    abort(); // TODO quit app
   } else
     fprintf(stderr, "%s is not a valid action\n", config.action);
 }

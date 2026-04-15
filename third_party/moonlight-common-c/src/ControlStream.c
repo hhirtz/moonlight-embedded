@@ -1,8 +1,5 @@
 #include "Limelight-internal.h"
 
-// This is a private header, but it just contains some time macros
-#include <enet/time.h>
-
 #ifndef MIN
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
 #endif
@@ -87,8 +84,6 @@ typedef struct _QUEUED_ASYNC_CALLBACK {
 } QUEUED_ASYNC_CALLBACK, *PQUEUED_ASYNC_CALLBACK;
 
 static SOCKET ctlSock = INVALID_SOCKET;
-static ENetHost* client;
-static ENetPeer* peer;
 static PLT_MUTEX enetMutex;
 static bool usePeriodicPing;
 
@@ -521,279 +516,7 @@ static PNVCTL_TCP_PACKET_HEADER readNvctlPacketTcp(void) {
     return fullPacket;
 }
 
-static bool encryptControlMessage(PNVCTL_ENCRYPTED_PACKET_HEADER encPacket, PNVCTL_ENET_PACKET_HEADER_V2 packet) {
-    unsigned char iv[16] = { 0 };
-    int ivSize;
-    int encryptedSize = sizeof(*packet) + packet->payloadLength;
-
-    // NB: Setting the IV must happen while encPacket->seq is still in native byte-order!
-    if (EncryptionFeaturesEnabled & SS_ENC_CONTROL_V2) {
-        // Populate the IV in little endian byte order
-        iv[3] = (unsigned char)(encPacket->seq >> 24);
-        iv[2] = (unsigned char)(encPacket->seq >> 16);
-        iv[1] = (unsigned char)(encPacket->seq >> 8);
-        iv[0] = (unsigned char)(encPacket->seq >> 0);
-
-        // Set high bytes to something unique to ensure no IV collisions
-        iv[10] = (unsigned char)'C'; // Client originated
-        iv[11] = (unsigned char)'C'; // Control stream
-
-        // Use 12-byte IV which is ideal for AES-GCM
-        ivSize = 12;
-    }
-    else {
-        // This is a truncating cast, but it's what Nvidia does, so we have to mimic it.
-        iv[0] = (unsigned char)encPacket->seq;
-
-        // Nvidia's old style encryption uses a 16-byte IV
-        ivSize = 16;
-    }
-
-    encPacket->encryptedHeaderType = LE16(encPacket->encryptedHeaderType);
-    encPacket->length = LE16(encPacket->length);
-    encPacket->seq = LE32(encPacket->seq);
-
-    packet->type = LE16(packet->type);
-    packet->payloadLength = LE16(packet->payloadLength);
-
-    LC_ASSERT(ivSize <= (int)sizeof(iv));
-    LC_ASSERT(ivSize == 12 || ivSize == 16);
-    return PltEncryptMessage(encryptionCtx, ALGORITHM_AES_GCM, 0,
-                             (unsigned char*)StreamConfig.remoteInputAesKey, sizeof(StreamConfig.remoteInputAesKey),
-                             iv, ivSize,
-                             (unsigned char*)(encPacket + 1), AES_GCM_TAG_LENGTH, // Write tag into the space after the encrypted header
-                             (unsigned char*)packet, encryptedSize,
-                             ((unsigned char*)(encPacket + 1)) + AES_GCM_TAG_LENGTH, &encryptedSize); // Write ciphertext after the GCM tag
-}
-
 // Caller must free() *packet on success!!!
-static bool decryptControlMessageToV1(PNVCTL_ENCRYPTED_PACKET_HEADER encPacket, int encPacketLength, PNVCTL_ENET_PACKET_HEADER_V1* packet, int* packetLength) {
-    unsigned char iv[16] = { 0 };
-    int ivSize;
-
-    *packet = NULL;
-
-    // It must be an encrypted packet to begin with
-    LC_ASSERT(encPacket->encryptedHeaderType == 0x0001);
-
-    // Make sure the host isn't lying to us about the packet length
-    int expectedEncLength = encPacket->length + sizeof(encPacket->encryptedHeaderType) + sizeof(encPacket->length);
-    LC_ASSERT(encPacketLength == expectedEncLength);
-    if (encPacketLength < expectedEncLength) {
-        Limelog("Length exceeds packet boundary (needed %d, got %d)\n", expectedEncLength, encPacketLength);
-        return false;
-    }
-
-    // Check length first so we don't underflow
-    if (encPacket->length < sizeof(encPacket->seq) + AES_GCM_TAG_LENGTH + sizeof(NVCTL_ENET_PACKET_HEADER_V2)) {
-        Limelog("Received runt packet (%d). Unable to decrypt.\n", encPacket->length);
-        return false;
-    }
-
-    if (EncryptionFeaturesEnabled & SS_ENC_CONTROL_V2) {
-        // Populate the IV in little endian byte order
-        iv[3] = (unsigned char)(encPacket->seq >> 24);
-        iv[2] = (unsigned char)(encPacket->seq >> 16);
-        iv[1] = (unsigned char)(encPacket->seq >> 8);
-        iv[0] = (unsigned char)(encPacket->seq >> 0);
-
-        // Set high bytes to something unique to ensure no IV collisions
-        iv[10] = (unsigned char)'H'; // Host originated
-        iv[11] = (unsigned char)'C'; // Control stream
-
-        // Use 12-byte IV which is ideal for AES-GCM
-        ivSize = 12;
-    }
-    else {
-        // This is a truncating cast, but it's what Nvidia does, so we have to mimic it.
-        iv[0] = (unsigned char)encPacket->seq;
-
-        // Nvidia's old style encryption uses a 16-byte IV
-        ivSize = 16;
-    }
-
-    int plaintextLength = encPacket->length - sizeof(encPacket->seq) - AES_GCM_TAG_LENGTH;
-    *packet = malloc(plaintextLength);
-    if (*packet == NULL) {
-        return false;
-    }
-
-    LC_ASSERT(ivSize <= (int)sizeof(iv));
-    LC_ASSERT(ivSize == 12 || ivSize == 16);
-    if (!PltDecryptMessage(decryptionCtx, ALGORITHM_AES_GCM, 0,
-                           (unsigned char*)StreamConfig.remoteInputAesKey, sizeof(StreamConfig.remoteInputAesKey),
-                           iv, ivSize,
-                           (unsigned char*)(encPacket + 1), AES_GCM_TAG_LENGTH, // The tag is located right after the header
-                           ((unsigned char*)(encPacket + 1)) + AES_GCM_TAG_LENGTH, plaintextLength, // The ciphertext is after the tag
-                           (unsigned char*)*packet, &plaintextLength)) {
-        free(*packet);
-        return false;
-    }
-
-    // Now we do an in-place V2 to V1 header conversion, so our existing parsing code doesn't have to change.
-    // All we need to do is eliminate the new length field in V2 by shifting everything by 2 bytes.
-    memmove(((unsigned char*)*packet) + 2, ((unsigned char*)*packet) + 4, plaintextLength - 4);
-    *packetLength = plaintextLength - 2;
-
-    return true;
-}
-
-static void enetPacketFreeCb(ENetPacket* packet) {
-    if (packet->userData) {
-        // userData contains a bool that we will set when freed
-        *(volatile bool*)packet->userData = true;
-    }
-}
-
-
-// Must be called with enetMutex held
-static bool isPacketSentWaitingForAck(ENetPacket* packet) {
-    ENetOutgoingCommand* outgoingCommand = NULL;
-    ENetListIterator currentCommand;
-
-    // Look for our packet on the sent commands list
-    for (currentCommand = enet_list_begin(&peer->sentReliableCommands);
-         currentCommand != enet_list_end(&peer->sentReliableCommands);
-         currentCommand = enet_list_next(currentCommand))
-    {
-        outgoingCommand = (ENetOutgoingCommand*)currentCommand;
-        if (outgoingCommand->packet == packet) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-static bool sendMessageEnet(short ptype, short paylen, const void* payload, uint8_t channelId, uint32_t flags, bool moreData) {
-    ENetPacket* enetPacket;
-    int err;
-
-    LC_ASSERT(AppVersionQuad[0] >= 5);
-
-    // Only send reliable packets to GFE
-    if (!IS_SUNSHINE()) {
-        flags = ENET_PACKET_FLAG_RELIABLE;
-    }
-
-    if (encryptedControlStream) {
-        PNVCTL_ENCRYPTED_PACKET_HEADER encPacket;
-        PNVCTL_ENET_PACKET_HEADER_V2 packet;
-        char tempBuffer[256];
-
-        enetPacket = enet_packet_create(NULL,
-                                        sizeof(*encPacket) + AES_GCM_TAG_LENGTH + sizeof(*packet) + paylen,
-                                        flags);
-        if (enetPacket == NULL) {
-            return false;
-        }
-
-        // We (ab)use the enetMutex to protect currentEnetSequenceNumber and the cipherContext
-        // used inside encryptControlMessage().
-        PltLockMutex(&enetMutex);
-
-        encPacket = (PNVCTL_ENCRYPTED_PACKET_HEADER)enetPacket->data;
-        encPacket->encryptedHeaderType = 0x0001;
-        encPacket->length = sizeof(encPacket->seq) + AES_GCM_TAG_LENGTH + sizeof(*packet) + paylen;
-        encPacket->seq = currentEnetSequenceNumber++;
-
-        // Construct the plaintext data for encryption
-        LC_ASSERT(sizeof(*packet) + paylen < sizeof(tempBuffer));
-        packet = (PNVCTL_ENET_PACKET_HEADER_V2)tempBuffer;
-        packet->type = ptype;
-        packet->payloadLength = paylen;
-        memcpy(&packet[1], payload, paylen);
-
-        // Encrypt the data into the final packet (and byteswap for BE machines)
-        if (!encryptControlMessage(encPacket, packet)) {
-            Limelog("Failed to encrypt control stream message\n");
-            enet_packet_destroy(enetPacket);
-            PltUnlockMutex(&enetMutex);
-            return false;
-        }
-
-        // enetMutex still locked here
-    }
-    else {
-        PNVCTL_ENET_PACKET_HEADER_V1 packet;
-        enetPacket = enet_packet_create(NULL, sizeof(*packet) + paylen,
-                                        flags);
-        if (enetPacket == NULL) {
-            return false;
-        }
-
-        packet = (PNVCTL_ENET_PACKET_HEADER_V1)enetPacket->data;
-        packet->type = LE16(ptype);
-        memcpy(&packet[1], payload, paylen);
-
-        PltLockMutex(&enetMutex);
-    }
-
-    volatile bool packetFreed = false;
-
-    // Set a callback to use to let us know if the packet has been freed.
-    // Freeing can only happen when the packet is acked or send fails.
-    enetPacket->userData = (void*)&packetFreed;
-    enetPacket->freeCallback = enetPacketFreeCb;
-
-    // Always use channel 0 for GFE and if the requested channel exceeds
-    // the peer's supported channel count.
-    if (!IS_SUNSHINE() || channelId >= peer->channelCount) {
-        channelId = 0;
-    }
-
-    // Queue the packet to be sent
-    err = enet_peer_send(peer, channelId, enetPacket);
-    bool packetQueued = (err == 0);
-
-    // If there is no more data coming soon, send the packet now
-    if (!moreData && packetQueued) {
-        err = enet_host_service(client, NULL, 0);
-
-        // Wait until the packet is actually sent to provide backpressure on senders
-        if (flags & ENET_PACKET_FLAG_RELIABLE) {
-            // Don't wait longer than 10 milliseconds to avoid blocking callers for too long
-            for (int i = 0; err >= 0 && i < 10; i++) {
-                // Break on disconnected, acked/freed, or sent (pending ack).
-                if (peer->state != ENET_PEER_STATE_CONNECTED || packetFreed || isPacketSentWaitingForAck(enetPacket)) {
-                    break;
-                }
-
-                // Release the lock before sleeping to allow another thread to send/receive
-                PltUnlockMutex(&enetMutex);
-                PltSleepMs(1);
-                PltLockMutex(&enetMutex);
-
-                // Try to send the packet again
-                err = enet_host_service(client, NULL, 0);
-            }
-
-            if (err >= 0 && peer->state == ENET_PEER_STATE_CONNECTED && !packetFreed && !isPacketSentWaitingForAck(enetPacket)) {
-                Limelog("Control message took over 10 ms to send (net latency: %u ms | packet loss: %f%%)\n",
-                        peer->roundTripTime, peer->packetLoss / (float)ENET_PEER_PACKET_LOSS_SCALE);
-            }
-        }
-    }
-
-    // Remove the free callback now that the packet was sent
-    if (!packetFreed) {
-        enetPacket->userData = NULL;
-        enetPacket->freeCallback = NULL;
-    }
-
-    PltUnlockMutex(&enetMutex);
-
-    if (err < 0) {
-        Limelog("Failed to send ENet control packet\n");
-        if (!packetQueued) {
-            enet_packet_destroy(enetPacket);
-        }
-        return false;
-    }
-
-    return true;
-}
-
 static bool sendMessageTcp(short ptype, short paylen, const void* payload) {
     PNVCTL_TCP_PACKET_HEADER packet;
     SOCK_RET err;
@@ -820,64 +543,25 @@ static bool sendMessageTcp(short ptype, short paylen, const void* payload) {
 }
 
 static bool sendMessageAndForget(short ptype, short paylen, const void* payload, uint8_t channelId, uint32_t flags, bool moreData) {
-    bool ret;
-
-    // Unlike regular sockets, ENet sockets aren't safe to invoke from multiple
-    // threads at once. We have to synchronize them with a lock.
-    if (AppVersionQuad[0] >= 5) {
-        ret = sendMessageEnet(ptype, paylen, payload, channelId, flags, moreData);
-    }
-    else {
-        ret = sendMessageTcp(ptype, paylen, payload);
-    }
-
-    return ret;
+  abort(); // TODO
 }
 
 static bool sendMessageAndDiscardReply(short ptype, short paylen, const void* payload, uint8_t channelId, uint32_t flags, bool moreData) {
-    if (AppVersionQuad[0] >= 5) {
-        if (!sendMessageEnet(ptype, paylen, payload, channelId, flags, moreData)) {
-            return false;
-        }
+    PNVCTL_TCP_PACKET_HEADER reply;
+
+    if (!sendMessageTcp(ptype, paylen, payload)) {
+        return false;
     }
-    else {
-        PNVCTL_TCP_PACKET_HEADER reply;
 
-        if (!sendMessageTcp(ptype, paylen, payload)) {
-            return false;
-        }
-
-        // Discard the response
-        reply = readNvctlPacketTcp();
-        if (reply == NULL) {
-            return false;
-        }
-
-        free(reply);
+    // Discard the response
+    reply = readNvctlPacketTcp();
+    if (reply == NULL) {
+        return false;
     }
+
+    free(reply);
 
     return true;
-}
-
-// This intercept function drops disconnect events to allow us to process
-// pending receives first. It works around what appears to be a bug in ENet
-// where pending disconnects can cause loss of unprocessed received data.
-static int ignoreDisconnectIntercept(ENetHost* host, ENetEvent* event) {
-    if (host->receivedDataLength == sizeof(ENetProtocolHeader) + sizeof(ENetProtocolDisconnect)) {
-        ENetProtocolHeader* protoHeader = (ENetProtocolHeader*)host->receivedData;
-        ENetProtocolDisconnect* disconnect = (ENetProtocolDisconnect*)(protoHeader + 1);
-
-        if ((disconnect->header.command & ENET_PROTOCOL_COMMAND_MASK) == ENET_PROTOCOL_COMMAND_DISCONNECT) {
-            Limelog("ENet disconnect event pending\n");
-            disconnectPending = true;
-            if (event) {
-                event->type = ENET_EVENT_TYPE_NONE;
-            }
-            return 1;
-        }
-    }
-
-    return 0;
 }
 
 static void asyncCallbackThreadFunc(void* context) {
@@ -1086,157 +770,17 @@ static void controlReceiveThreadFunc(void* context) {
     }
 
     while (!PltIsThreadInterrupted(&controlReceiveThread)) {
-        ENetEvent event;
-        enet_uint32 waitTimeMs;
-
-        PltLockMutex(&enetMutex);
+      struct {int type;} event;
 
         // Poll for new packets and process retransmissions
-        err = serviceEnetHost(client, &event, 0);
 
         // Compute the next time we need to wake up to handle
         // the RTO timer or a ping.
-        if (err == 0) {
-            if (ENET_TIME_LESS(peer->nextTimeout, client->serviceTime)) {
-                // This can happen when we have no unacked reliable messages
-                waitTimeMs = 10;
-            }
-            else {
-                // We add 1 ms just to ensure we're unlikely to undershoot the sleep() and have to
-                // do a tiny sleep for another iteration before the timeout is ready to be serviced.
-                waitTimeMs = ENET_TIME_DIFFERENCE(peer->nextTimeout, client->serviceTime) + 1;
-            }
 
-            // Ensure we don't sleep through a ping
-            if (peer->lastReceiveTime && peer->lastSendTime) {
-                enet_uint32 timeSinceLastRecv = ENET_TIME_DIFFERENCE(client->serviceTime, peer->lastReceiveTime);
-                enet_uint32 timeSinceLastSend = ENET_TIME_DIFFERENCE(client->serviceTime, peer->lastSendTime);
-                enet_uint32 timeSinceLastComm = MIN(timeSinceLastSend, timeSinceLastRecv);
-
-                if (timeSinceLastComm >= peer->pingInterval) {
-                    // Ping is due now for this peer
-                    waitTimeMs = 0;
-                } else {
-                    waitTimeMs = MIN(waitTimeMs, peer->pingInterval - timeSinceLastComm);
-                }
-            }
-            else {
-                waitTimeMs = MIN(waitTimeMs, peer->pingInterval);
-            }
-        }
-
-        PltUnlockMutex(&enetMutex);
-
-        if (err == 0) {
-            // Handle a pending disconnect after unsuccessfully polling
-            // for new events to handle.
-            if (disconnectPending) {
-                PltLockMutex(&enetMutex);
-                // Wait 100 ms for pending receives after a disconnect and
-                // 1 second for the pending disconnect to be processed after
-                // removing the intercept callback.
-                err = serviceEnetHost(client, &event, client->intercept ? 100 : 1000);
-                if (err == 0) {
-                    if (client->intercept) {
-                        // Now that no pending receive events remain, we can
-                        // remove our intercept hook and allow the server's
-                        // disconnect to be processed as expected. We will wait
-                        // 1 second for this disconnect to be processed before
-                        // we tear down the connection anyway.
-                        client->intercept = NULL;
-                        PltUnlockMutex(&enetMutex);
-                        continue;
-                    }
-                    else {
-                        // The 1 second timeout has expired with no disconnect event
-                        // retransmission after the first notification. We can only
-                        // assume the server died tragically, so go ahead and tear down.
-                        PltUnlockMutex(&enetMutex);
-                        Limelog("Disconnect event timeout expired\n");
-                        ListenerCallbacks.connectionTerminated(-1);
-                        return;
-                    }
-                }
-                else {
-                    PltUnlockMutex(&enetMutex);
-                }
-            }
-            else {
-                // No events ready - wait for readability or a local RTO timer to expire
-                enet_uint32 condition = ENET_SOCKET_WAIT_RECEIVE;
-                enet_socket_wait(client->socket, &condition, waitTimeMs);
-                continue;
-            }
-        }
-
-        if (err < 0) {
-            // The error from serviceEnetHost() should be propagated via LastSocketError()
-            LC_ASSERT(err == -1);
-
-            err = LastSocketFail();
-            Limelog("Control stream connection failed: %d\n", err);
-            ListenerCallbacks.connectionTerminated(err);
-            return;
-        }
-
-        if (event.type == ENET_EVENT_TYPE_RECEIVE) {
-            PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr;
-            int packetLength;
-
-            if (event.packet->dataLength < sizeof(*ctlHdr)) {
-                Limelog("Discarding runt control packet: %d < %d\n", event.packet->dataLength, (int)sizeof(*ctlHdr));
-                enet_packet_destroy(event.packet);
-                continue;
-            }
-
-            ctlHdr = (PNVCTL_ENET_PACKET_HEADER_V1)event.packet->data;
-            ctlHdr->type = LE16(ctlHdr->type);
-
-            if (encryptedControlStream) {
-                // V2 headers can be interpreted as V1 headers for the purpose of examining type,
-                // so this check is safe.
-                if (ctlHdr->type == 0x0001) {
-                    PNVCTL_ENCRYPTED_PACKET_HEADER encHdr;
-
-                    if (event.packet->dataLength < sizeof(NVCTL_ENCRYPTED_PACKET_HEADER)) {
-                        Limelog("Discarding runt encrypted control packet: %d < %d\n", event.packet->dataLength, (int)sizeof(NVCTL_ENCRYPTED_PACKET_HEADER));
-                        enet_packet_destroy(event.packet);
-                        continue;
-                    }
-
-                    // encryptedHeaderType is already byteswapped by aliasing through ctlHdr above
-                    encHdr = (PNVCTL_ENCRYPTED_PACKET_HEADER)event.packet->data;
-                    encHdr->length = LE16(encHdr->length);
-                    encHdr->seq = LE32(encHdr->seq);
-
-                    ctlHdr = NULL;
-                    packetLength = (int)event.packet->dataLength;
-                    if (!decryptControlMessageToV1(encHdr, packetLength, &ctlHdr, &packetLength)) {
-                        Limelog("Failed to decrypt control packet of size %d\n", event.packet->dataLength);
-                        enet_packet_destroy(event.packet);
-                        continue;
-                    }
-
-                    // We need to byteswap the unsealed header too
-                    ctlHdr->type = LE16(ctlHdr->type);
-                }
-                else {
-                    LC_ASSERT_VT(false);
-                    Limelog("Discarding unencrypted packet on encrypted control stream: %04x\n", ctlHdr->type);
-                    enet_packet_destroy(event.packet);
-                    continue;
-                }
-            }
-            else {
-                // Take ownership of the packet data directly for the non-encrypted case
-                packetLength = (int)event.packet->dataLength;
-                event.packet->data = NULL;
-            }
-
-            // We're done with the packet struct
-            enet_packet_destroy(event.packet);
-
-            // All below codepaths must free ctlHdr!!!
+        if (event.type == 0 /*ENET_EVENT_TYPE_RECEIVE*/) {
+          // Parse packet
+          PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr;
+          int packetLength;
 
             // Process HDR data immediately to update global HDR enabled state and HDR metadata.
             // The actual client callback will be invoked in the async callback thread.
@@ -1343,9 +887,6 @@ static void controlReceiveThreadFunc(void* context) {
                 // message once it sends this message, so we mark the peer as fully
                 // disconnected now to avoid delays waiting for an ack that will
                 // never arrive.
-                PltLockMutex(&enetMutex);
-                enet_peer_disconnect_now(peer, 0);
-                PltUnlockMutex(&enetMutex);
                 ListenerCallbacks.connectionTerminated((int)terminationErrorCode);
                 free(ctlHdr);
                 return;
@@ -1353,113 +894,11 @@ static void controlReceiveThreadFunc(void* context) {
 
             free(ctlHdr);
         }
-        else if (event.type == ENET_EVENT_TYPE_DISCONNECT) {
+        else if (event.type == 0 /* DISCONNECT */) {
             Limelog("Control stream received unexpected disconnect event\n");
             ListenerCallbacks.connectionTerminated(-1);
             return;
         }
-    }
-}
-
-static void lossStatsThreadFunc(void* context) {
-    BYTE_BUFFER byteBuffer;
-
-    if (usePeriodicPing) {
-        char periodicPingPayload[8];
-
-        BbInitializeWrappedBuffer(&byteBuffer, periodicPingPayload, 0, sizeof(periodicPingPayload), BYTE_ORDER_LITTLE);
-        BbPut16(&byteBuffer, 4); // Length of payload
-        BbPut32(&byteBuffer, 0); // Timestamp?
-
-        while (!PltIsThreadInterrupted(&lossStatsThread)) {
-            // For Sunshine servers, send the more detailed per-frame FEC messages
-            if (IS_SUNSHINE()) {
-                PQUEUED_FRAME_FEC_STATUS queuedFrameStatus;
-
-                // Sunshine should always use ENet for control messages
-                LC_ASSERT(peer != NULL);
-
-                while (LbqPollQueueElement(&frameFecStatusQueue, (void**)&queuedFrameStatus) == LBQ_SUCCESS) {
-                    // Send as an unreliable packet, since it's not a critical message
-                    if (!sendMessageEnet(SS_FRAME_FEC_PTYPE,
-                                         sizeof(queuedFrameStatus->fecStatus),
-                                         &queuedFrameStatus->fecStatus,
-                                         CTRL_CHANNEL_GENERIC,
-                                         ENET_PACKET_FLAG_UNSEQUENCED,
-                                         LbqGetItemCount(&frameFecStatusQueue) > 0)) {
-                        Limelog("Loss Stats: Sending frame FEC status message failed: %d\n", (int)LastSocketError());
-                        ListenerCallbacks.connectionTerminated(LastSocketFail());
-                        free(queuedFrameStatus);
-                        return;
-                    }
-
-                    free(queuedFrameStatus);
-                }
-            }
-
-            // Send the message (and don't expect a response)
-            //
-            // NB: We send this periodic message as reliable to ensure the RTT is recomputed
-            // regularly. This only happens when an ACK is received to a reliable packet.
-            // Since the other traffic on this channel is unsequenced, it doesn't really
-            // cause any negative HOL blocking side-effects.
-            if (!sendMessageAndForget(0x0200,
-                                      sizeof(periodicPingPayload),
-                                      periodicPingPayload,
-                                      CTRL_CHANNEL_GENERIC,
-                                      ENET_PACKET_FLAG_RELIABLE,
-                                      false)) {
-                Limelog("Loss Stats: Transaction failed: %d\n", (int)LastSocketError());
-                ListenerCallbacks.connectionTerminated(LastSocketFail());
-                return;
-            }
-
-            // Wait a bit
-            PltSleepMsInterruptible(&lossStatsThread, PERIODIC_PING_INTERVAL_MS);
-        }
-    }
-    else {
-        char* lossStatsPayload;
-
-        // Sunshine should use the newer codepath above
-        LC_ASSERT(!IS_SUNSHINE());
-
-        lossStatsPayload = malloc(payloadLengths[IDX_LOSS_STATS]);
-        if (lossStatsPayload == NULL) {
-            Limelog("Loss Stats: malloc() failed\n");
-            ListenerCallbacks.connectionTerminated(-1);
-            return;
-        }
-
-        while (!PltIsThreadInterrupted(&lossStatsThread)) {
-            // Construct the payload
-            BbInitializeWrappedBuffer(&byteBuffer, lossStatsPayload, 0, payloadLengths[IDX_LOSS_STATS], BYTE_ORDER_LITTLE);
-            BbPut32(&byteBuffer, 0);
-            BbPut32(&byteBuffer, LOSS_REPORT_INTERVAL_MS);
-            BbPut32(&byteBuffer, 1000);
-            BbPut64(&byteBuffer, lastGoodFrame);
-            BbPut32(&byteBuffer, 0);
-            BbPut32(&byteBuffer, 0);
-            BbPut32(&byteBuffer, 0x14);
-
-            // Send the message (and don't expect a response)
-            if (!sendMessageAndForget(packetTypes[IDX_LOSS_STATS],
-                                      payloadLengths[IDX_LOSS_STATS],
-                                      lossStatsPayload,
-                                      CTRL_CHANNEL_GENERIC,
-                                      0,
-                                      false)) {
-                free(lossStatsPayload);
-                Limelog("Loss Stats: Transaction failed: %d\n", (int)LastSocketError());
-                ListenerCallbacks.connectionTerminated(LastSocketFail());
-                return;
-            }
-
-            // Wait a bit
-            PltSleepMsInterruptible(&lossStatsThread, LOSS_REPORT_INTERVAL_MS);
-        }
-
-        free(lossStatsPayload);
     }
 }
 
@@ -1487,7 +926,7 @@ static void requestIdrFrame(void) {
                                         sizeof(payload),
                                         payload,
                                         CTRL_CHANNEL_URGENT,
-                                        ENET_PACKET_FLAG_RELIABLE,
+                                        0,
                                         false)) {
             Limelog("Request IDR Frame: Transaction failed: %d\n", (int)LastSocketError());
             ListenerCallbacks.connectionTerminated(LastSocketFail());
@@ -1500,7 +939,7 @@ static void requestIdrFrame(void) {
                                         payloadLengths[IDX_REQUEST_IDR_FRAME],
                                         preconstructedPayloads[IDX_REQUEST_IDR_FRAME],
                                         CTRL_CHANNEL_URGENT,
-                                        ENET_PACKET_FLAG_RELIABLE,
+                                        0,
                                         false)) {
             Limelog("Request IDR Frame: Transaction failed: %d\n", (int)LastSocketError());
             ListenerCallbacks.connectionTerminated(LastSocketFail());
@@ -1525,7 +964,7 @@ static void requestInvalidateReferenceFrames(uint32_t startFrame, uint32_t endFr
     if (!sendMessageAndDiscardReply(packetTypes[IDX_INVALIDATE_REF_FRAMES],
                                     sizeof(payload),
                                     payload, CTRL_CHANNEL_URGENT,
-                                    ENET_PACKET_FLAG_RELIABLE,
+                                    0,
                                     false)) {
         Limelog("Request Invaldiate Reference Frames: Transaction failed: %d\n", (int)LastSocketError());
         ListenerCallbacks.connectionTerminated(LastSocketFail());
@@ -1613,17 +1052,6 @@ int stopControlStream(void) {
         PltJoinThread(&invalidateRefFramesThread);
     }
 
-    if (peer != NULL) {
-        // Gracefully disconnect to ensure the remote host receives all of our final
-        // outbound traffic, including any key up events that might be sent.
-        gracefullyDisconnectEnetPeer(client, peer, CONTROL_STREAM_LINGER_TIMEOUT_SEC * 1000);
-        peer = NULL;
-    }
-    if (client != NULL) {
-        enet_host_destroy(client);
-        client = NULL;
-    }
-
     if (ctlSock != INVALID_SOCKET) {
         closeSocket(ctlSock);
         ctlSock = INVALID_SOCKET;
@@ -1645,153 +1073,30 @@ int sendInputPacketOnControlStream(unsigned char* data, int length, uint8_t chan
 }
 
 // Called by the input stream to flush queued packets before a batching wait
-void flushInputOnControlStream(void) {
-    if (AppVersionQuad[0] >= 5) {
-        PltLockMutex(&enetMutex);
-        enet_host_flush(client);
-        PltUnlockMutex(&enetMutex);
-    }
-}
+void flushInputOnControlStream(void) {}
 
 bool isControlDataInTransit(void) {
-    bool ret = false;
-
-    PltLockMutex(&enetMutex);
-    if (peer != NULL && peer->state == ENET_PEER_STATE_CONNECTED) {
-        if (peer->reliableDataInTransit != 0) {
-            ret = true;
-        }
-    }
-    PltUnlockMutex(&enetMutex);
-
-    return ret;
+    return false;
 }
 
 bool LiGetEstimatedRttInfo(uint32_t* estimatedRtt, uint32_t* estimatedRttVariance) {
-    bool ret = false;
-
-    // We do not acquire enetMutex here because we're just reading metrics
-    // and observing a torn write every once in a while is totally fine.
-    // The peer pointer points to memory reserved inside the client object,
-    // so it's guaranteed that it will never go away underneath us.
-    if (peer != NULL && peer->state == ENET_PEER_STATE_CONNECTED) {
-        if (estimatedRtt != NULL) {
-            *estimatedRtt = peer->roundTripTime;
-        }
-
-        if (estimatedRttVariance != NULL) {
-            *estimatedRttVariance = peer->roundTripTimeVariance;
-        }
-
-        ret = true;
-    }
-
-    return ret;
+    return false;
 }
 
 // Starts the control stream
 int startControlStream(void) {
     int err;
 
-    if (AppVersionQuad[0] >= 5) {
-        ENetAddress remoteAddress, localAddress;
-        ENetEvent event;
-
-        LC_ASSERT(ControlPortNumber != 0);
-
-        enet_address_set_address(&localAddress, (struct sockaddr *)&LocalAddr, AddrLen);
-#ifdef __3DS__
-        // binding to wildcard port is broken on the 3DS, so we need to define a port manually
-        enet_address_set_port(&localAddress, htons(n3ds_udp_port++));
-#else
-        enet_address_set_port(&localAddress, 0); // Wildcard port
-#endif
-
-        enet_address_set_address(&remoteAddress, (struct sockaddr *)&RemoteAddr, AddrLen);
-        enet_address_set_port(&remoteAddress, ControlPortNumber);
-
-        // Create a client
-        client = enet_host_create(RemoteAddr.ss_family,
-                                  LocalAddr.ss_family != 0 ? &localAddress : NULL,
-                                  1, CTRL_CHANNEL_COUNT, 0, 0);
-        if (client == NULL) {
-            stopping = true;
-            return -1;
-        }
-
-        client->intercept = ignoreDisconnectIntercept;
-
-        // Enable high priority QoS marking on control stream traffic
-        //
-        // NB: It is important to do this before connecting because there's logic in the connect
-        // retransmission code to detect QoS-intolerant routes and disable QoS marking for those.
-        enet_socket_set_option (client->socket, ENET_SOCKOPT_QOS, 1);
-
-        // Connect to the host
-        peer = enet_host_connect(client, &remoteAddress, CTRL_CHANNEL_COUNT, ControlConnectData);
-        if (peer == NULL) {
-            stopping = true;
-            enet_host_destroy(client);
-            client = NULL;
-            return -1;
-        }
-
-        // Wait for the connect to complete
-        err = serviceEnetHost(client, &event, CONTROL_STREAM_TIMEOUT_SEC * 1000);
-        if (err <= 0 || event.type != ENET_EVENT_TYPE_CONNECT) {
-            if (err < 0) {
-                Limelog("Failed to establish ENet connection on UDP port %u: error %d\n", ControlPortNumber, LastSocketFail());
-            }
-            else if (err == 0) {
-                Limelog("Failed to establish ENet connection on UDP port %u: timed out\n", ControlPortNumber);
-            }
-            else {
-                Limelog("Failed to establish ENet connection on UDP port %u: unexpected event %d (error: %d)\n", ControlPortNumber, (int)event.type, LastSocketError());
-            }
-
-            stopping = true;
-            enet_peer_reset(peer);
-            peer = NULL;
-            enet_host_destroy(client);
-            client = NULL;
-
-            if (err == 0) {
-                return ETIMEDOUT;
-            }
-            else if (err > 0 && event.type != ENET_EVENT_TYPE_CONNECT && LastSocketError() == 0) {
-                // If we got an unexpected event type and have no other error to return, return the event type
-                LC_ASSERT(event.type != ENET_EVENT_TYPE_NONE);
-                return event.type != ENET_EVENT_TYPE_NONE ? (int)event.type : LastSocketFail();
-            }
-            else {
-                return LastSocketFail();
-            }
-        }
-
-        // Ensure the connect verify ACK is sent immediately
-        enet_host_flush(client);
-
-#ifdef __3DS__
-        // Set the peer timeout to 1 minute and limit backoff to 2x RTT
-        // The 3DS can take a bit longer to set up when starting fresh
-        enet_peer_timeout(peer, 2, 60000, 60000);
-#else
-        // Set the peer timeout to 10 seconds and limit backoff to 2x RTT
-        enet_peer_timeout(peer, 2, 10000, 10000);
-#endif
+    // NB: Do NOT use ControlPortNumber here. 47995 is correct for these old versions.
+    LC_ASSERT(ControlPortNumber == 0);
+    ctlSock = connectTcpSocket(&RemoteAddr, AddrLen,
+        47995, CONTROL_STREAM_TIMEOUT_SEC);
+    if (ctlSock == INVALID_SOCKET) {
+        stopping = true;
+        return LastSocketFail();
     }
-    else {
-        // NB: Do NOT use ControlPortNumber here. 47995 is correct for these old versions.
-        LC_ASSERT(ControlPortNumber == 0);
-        ctlSock = connectTcpSocket(&RemoteAddr, AddrLen,
-            47995, CONTROL_STREAM_TIMEOUT_SEC);
-        if (ctlSock == INVALID_SOCKET) {
-            stopping = true;
-            return LastSocketFail();
-        }
 
-        enableNoDelay(ctlSock);
-    }
+    enableNoDelay(ctlSock);
 
     err = PltCreateThread("ControlRecv", controlReceiveThreadFunc, NULL, &controlReceiveThread);
     if (err != 0) {
@@ -1799,12 +1104,6 @@ int startControlStream(void) {
         if (ctlSock != INVALID_SOCKET) {
             closeSocket(ctlSock);
             ctlSock = INVALID_SOCKET;
-        }
-        else {
-            enet_peer_disconnect_now(peer, 0);
-            peer = NULL;
-            enet_host_destroy(client);
-            client = NULL;
         }
         return err;
     }
@@ -1814,7 +1113,7 @@ int startControlStream(void) {
                                     payloadLengths[IDX_START_A],
                                     preconstructedPayloads[IDX_START_A],
                                     CTRL_CHANNEL_GENERIC,
-                                    ENET_PACKET_FLAG_RELIABLE,
+                                    0,
                                     false)) {
         Limelog("Start A failed: %d\n", (int)LastSocketError());
         err = LastSocketFail();
@@ -1834,12 +1133,6 @@ int startControlStream(void) {
             closeSocket(ctlSock);
             ctlSock = INVALID_SOCKET;
         }
-        else {
-            enet_peer_disconnect_now(peer, 0);
-            peer = NULL;
-            enet_host_destroy(client);
-            client = NULL;
-        }
         return err;
     }
 
@@ -1848,7 +1141,7 @@ int startControlStream(void) {
                                     payloadLengths[IDX_START_B],
                                     preconstructedPayloads[IDX_START_B],
                                     CTRL_CHANNEL_GENERIC,
-                                    ENET_PACKET_FLAG_RELIABLE,
+                                    0,
                                     false)) {
         Limelog("Start B failed: %d\n", (int)LastSocketError());
         err = LastSocketFail();
@@ -1867,39 +1160,6 @@ int startControlStream(void) {
         if (ctlSock != INVALID_SOCKET) {
             closeSocket(ctlSock);
             ctlSock = INVALID_SOCKET;
-        }
-        else {
-            enet_peer_disconnect_now(peer, 0);
-            peer = NULL;
-            enet_host_destroy(client);
-            client = NULL;
-        }
-        return err;
-    }
-
-    err = PltCreateThread("LossStats", lossStatsThreadFunc, NULL, &lossStatsThread);
-    if (err != 0) {
-        stopping = true;
-
-        if (ctlSock != INVALID_SOCKET) {
-            shutdownTcpSocket(ctlSock);
-        }
-        else {
-            ConnectionInterrupted = true;
-        }
-
-        PltInterruptThread(&controlReceiveThread);
-        PltJoinThread(&controlReceiveThread);
-
-        if (ctlSock != INVALID_SOCKET) {
-            closeSocket(ctlSock);
-            ctlSock = INVALID_SOCKET;
-        }
-        else {
-            enet_peer_disconnect_now(peer, 0);
-            peer = NULL;
-            enet_host_destroy(client);
-            client = NULL;
         }
         return err;
     }
@@ -1924,12 +1184,6 @@ int startControlStream(void) {
         if (ctlSock != INVALID_SOCKET) {
             closeSocket(ctlSock);
             ctlSock = INVALID_SOCKET;
-        }
-        else {
-            enet_peer_disconnect_now(peer, 0);
-            peer = NULL;
-            enet_host_destroy(client);
-            client = NULL;
         }
 
         return err;
@@ -1959,12 +1213,6 @@ int startControlStream(void) {
         if (ctlSock != INVALID_SOCKET) {
             closeSocket(ctlSock);
             ctlSock = INVALID_SOCKET;
-        }
-        else {
-            enet_peer_disconnect_now(peer, 0);
-            peer = NULL;
-            enet_host_destroy(client);
-            client = NULL;
         }
 
         return err;
@@ -2000,12 +1248,6 @@ int startControlStream(void) {
             if (ctlSock != INVALID_SOCKET) {
                 closeSocket(ctlSock);
                 ctlSock = INVALID_SOCKET;
-            }
-            else {
-                enet_peer_disconnect_now(peer, 0);
-                peer = NULL;
-                enet_host_destroy(client);
-                client = NULL;
             }
 
             return err;
