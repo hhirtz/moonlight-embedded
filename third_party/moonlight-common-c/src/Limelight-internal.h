@@ -11,8 +11,6 @@
 #include "RtpVideoQueue.h"
 #include "ByteBuffer.h"
 
-#include <enet/enet.h>
-
 // Common globals
 extern char* RemoteAddrString;
 extern struct sockaddr_storage RemoteAddr;
@@ -101,8 +99,6 @@ extern uint32_t EncryptionFeaturesEnabled;
 // Internal macro for checking the magic byte of the audio configuration value
 #define MAGIC_BYTE_FROM_AUDIO_CONFIG(x) ((x) & 0xFF)
 
-int serviceEnetHost(ENetHost* client, ENetEvent* event, enet_uint32 timeoutMs);
-int gracefullyDisconnectEnetPeer(ENetHost* host, ENetPeer* peer, enet_uint32 lingerTimeoutMs);
 int extractVersionQuadFromString(const char* string, int* quad);
 bool isReferenceFrameInvalidationSupportedByDecoder(void);
 bool isReferenceFrameInvalidationEnabled(void);
