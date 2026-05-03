@@ -38,6 +38,7 @@
 #endif
 
 #include <Limelight.h>
+#include <riichi.h>
 
 #include <client.h>
 #include <discover.h>
@@ -55,8 +56,8 @@
 #include <openssl/rand.h>
 
 static void applist(PSERVER_DATA server) {
-  PAPP_LIST list = NULL;
-  if (gs_applist(server, &list) != GS_OK) {
+  struct riichi_app_list *list = NULL;
+  if (riichi_applist(server->serverInfo.address, &list) != GS_OK) {
     fprintf(stderr, "Can't get app list\n");
     return;
   }
@@ -67,29 +68,7 @@ static void applist(PSERVER_DATA server) {
   }
 }
 
-static int get_app_id(PSERVER_DATA server, const char *name) {
-  PAPP_LIST list = NULL;
-  if (gs_applist(server, &list) != GS_OK) {
-    fprintf(stderr, "Can't get app list\n");
-    return -1;
-  }
-
-  while (list != NULL) {
-    if (strcmp(list->name, name) == 0)
-      return list->id;
-
-    list = list->next;
-  }
-  return -1;
-}
-
 static void stream(PSERVER_DATA server, PCONFIGURATION config, enum platform system) {
-  int appId = get_app_id(server, config->app);
-  if (appId<0) {
-    fprintf(stderr, "Can't find app %s\n", config->app);
-    exit(-1);
-  }
-
   int gamepads = 0;
   gamepads += evdev_gamepads;
   #ifdef HAVE_SDL
@@ -98,21 +77,6 @@ static void stream(PSERVER_DATA server, PCONFIGURATION config, enum platform sys
   int gamepad_mask = 0;
   for (int i = 0; i < gamepads; i++)
     gamepad_mask = (gamepad_mask << 1) + 1;
-
-  int ret = gs_start_app(server, &config->stream, appId, config->sops, config->localaudio, gamepad_mask);
-  if (ret < 0) {
-    if (ret == GS_NOT_SUPPORTED_4K)
-      fprintf(stderr, "Server doesn't support 4K\n");
-    else if (ret == GS_NOT_SUPPORTED_MODE)
-      fprintf(stderr, "Server doesn't support %dx%d (%d fps) or remove --nounsupported option\n", config->stream.width, config->stream.height, config->stream.fps);
-    else if (ret == GS_NOT_SUPPORTED_SOPS_RESOLUTION)
-      fprintf(stderr, "Optimal Playable Settings isn't supported for the resolution %dx%d, use supported resolution or add --nosops option\n", config->stream.width, config->stream.height);
-    else if (ret == GS_ERROR)
-      fprintf(stderr, "Gamestream error: %s\n", gs_error);
-    else
-      fprintf(stderr, "Errorcode starting app: %d\n", ret);
-    exit(-1);
-  }
 
   int drFlags = 0;
   if (config->fullscreen)
@@ -143,7 +107,7 @@ static void stream(PSERVER_DATA server, PCONFIGURATION config, enum platform sys
     loop_init();
 
   platform_start(system);
-  LiStartConnection(&server->serverInfo, &config->stream, &connection_callbacks, platform_get_video(system), platform_get_audio(system, config->audio_device), NULL, drFlags, config->audio_device, 0);
+  LiStartConnection(&server->serverInfo, &config->stream, &connection_callbacks, platform_get_video(system), platform_get_audio(system, config->audio_device), NULL, drFlags, config->audio_device, 0, config->app);
 
   if (IS_EMBEDDED(system)) {
     if (!config->viewonly)
@@ -177,8 +141,6 @@ static void help() {
   printf("Usage: moonlight [action] (options) [host] [-port <number>]\n");
   printf("       moonlight [configfile]\n");
   printf("\n Actions\n\n");
-  printf("\tpair\t\t\tPair device with computer\n");
-  printf("\tunpair\t\t\tUnpair device with computer\n");
   printf("\tstream\t\t\tStream computer to device\n");
   printf("\tlist\t\t\tList available games and applications\n");
   printf("\tquit\t\t\tQuit the application or game being streamed\n");
@@ -228,13 +190,6 @@ static void help() {
   exit(0);
 }
 
-static void pair_check(PSERVER_DATA server) {
-  if (!server->paired) {
-    fprintf(stderr, "You must pair with the PC first\n");
-    exit(-1);
-  }
-}
-
 int main(int argc, char* argv[]) {
   CONFIGURATION config;
   config_parse(argc, argv, &config);
@@ -279,23 +234,9 @@ int main(int argc, char* argv[]) {
   SERVER_DATA server;
   printf("Connecting to %s...\n", config.address);
 
-  int ret;
-  if ((ret = gs_init(&server, config.address, config.port, config.key_dir, config.debug_level, config.unsupported)) == GS_OUT_OF_MEMORY) {
-    fprintf(stderr, "Not enough memory\n");
-    exit(-1);
-  } else if (ret == GS_ERROR) {
-    fprintf(stderr, "Gamestream error: %s\n", gs_error);
-    exit(-1);
-  } else if (ret == GS_INVALID) {
-    fprintf(stderr, "Invalid data received from server: %s\n", gs_error);
-    exit(-1);
-  } else if (ret == GS_UNSUPPORTED_VERSION) {
-    fprintf(stderr, "Unsupported version: %s\n", gs_error);
-    exit(-1);
-  } else if (ret != GS_OK) {
-    fprintf(stderr, "Can't connect to server %s\n", config.address);
-    exit(-1);
-  }
+  LiInitializeServerInformation(&server.serverInfo);
+  server.serverInfo.serverCodecModeSupport = 1;
+  server.serverInfo.address = config.address;
 
   if (config.debug_level > 0) {
     printf("GPU: %s, GFE: %s (%s, %s)\n", server.gpuType, server.serverInfo.serverInfoGfeVersion, server.gsVersion, server.serverInfo.serverInfoAppVersion);
@@ -303,10 +244,8 @@ int main(int argc, char* argv[]) {
   }
 
   if (strcmp("list", config.action) == 0) {
-    pair_check(&server);
     applist(&server);
   } else if (strcmp("stream", config.action) == 0) {
-    pair_check(&server);
     enum platform system = platform_check(config.platform);
     if (config.debug_level > 0)
       printf("Platform %s\n", platform_name(system));
@@ -393,28 +332,7 @@ int main(int argc, char* argv[]) {
     }
 
     stream(&server, &config, system);
-  } else if (strcmp("pair", config.action) == 0) {
-    char pin[5];
-    if (config.pin > 0 && config.pin <= 9999) {
-      sprintf(pin, "%04d", config.pin);
-    } else {
-      sprintf(pin, "%d%d%d%d", (unsigned)random() % 10, (unsigned)random() % 10, (unsigned)random() % 10, (unsigned)random() % 10);
-    }
-    printf("Please enter the following PIN on the target PC: %s\n", pin);
-    fflush(stdout);
-    if (gs_pair(&server, &pin[0]) != GS_OK) {
-      fprintf(stderr, "Failed to pair to server: %s\n", gs_error);
-    } else {
-      printf("Succesfully paired\n");
-    }
-  } else if (strcmp("unpair", config.action) == 0) {
-    if (gs_unpair(&server) != GS_OK) {
-      fprintf(stderr, "Failed to unpair to server: %s\n", gs_error);
-    } else {
-      printf("Succesfully unpaired\n");
-    }
   } else if (strcmp("quit", config.action) == 0) {
-    pair_check(&server);
     gs_quit_app(&server);
   } else
     fprintf(stderr, "%s is not a valid action\n", config.action);
